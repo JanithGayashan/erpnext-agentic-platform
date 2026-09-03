@@ -7,6 +7,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from erpnext_agentic.config import Settings
+from erpnext_agentic.erpnext_client import ERPNextDataError
 from erpnext_agentic.proposal_service import ProposalRequest, ProposalResponse
 from erpnext_agentic.replenishment import ReplenishmentProposal
 from erpnext_agentic.workflow import (
@@ -118,7 +119,8 @@ async def test_rejection_resumes_to_terminal_state() -> None:
 
 @pytest.mark.anyio
 async def test_approval_stops_before_any_erpnext_write() -> None:
-    graph = workflow(AsyncMock(return_value=proposal_response()))
+    builder = AsyncMock(return_value=proposal_response())
+    graph = workflow(builder)
     waiting = await graph.start(request(), requester_id="requester-1")
 
     approved = await graph.decide(
@@ -130,9 +132,79 @@ async def test_approval_stops_before_any_erpnext_write() -> None:
 
     assert approved.status == "APPROVED_NO_WRITE"
     assert approved.status_reason == (
-        "Approval recorded; ERPNext mutation is not implemented"
+        "Approved plan revalidated; ERPNext mutation is not implemented"
     )
+    assert approved.revalidation_plan_hash == waiting.plan_hash
+    assert approved.revalidated_at == NOW
     assert approved.waiting_for_approval is False
+    assert builder.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_changed_erpnext_data_invalidates_approval() -> None:
+    original = proposal_response()
+    changed = original.model_copy(
+        update={
+            "proposal": original.proposal.model_copy(
+                update={
+                    "projected_qty": Decimal("1"),
+                    "deficiency": Decimal("9"),
+                }
+            )
+        }
+    )
+    graph = workflow(AsyncMock(side_effect=[original, changed]))
+    waiting = await graph.start(request(), requester_id="requester-1")
+
+    stale = await graph.decide(
+        REQUEST_ID,
+        plan_hash=waiting.plan_hash or "",
+        approver_id="approver-1",
+        decision="approve",
+    )
+
+    assert stale.status == "STALE_REPLAN_REQUIRED"
+    assert stale.status_reason == (
+        "ERPNext data changed after approval; create a new plan"
+    )
+    assert stale.revalidation_plan_hash != waiting.plan_hash
+    assert stale.revalidation_proposal == changed
+
+
+@pytest.mark.anyio
+async def test_failed_revalidation_can_retry_the_same_approval_safely() -> None:
+    builder = AsyncMock(
+        side_effect=[
+            proposal_response(),
+            ERPNextDataError("temporary read failure"),
+            proposal_response(),
+        ]
+    )
+    graph = workflow(builder)
+    waiting = await graph.start(request(), requester_id="requester-1")
+
+    with pytest.raises(ERPNextDataError):
+        await graph.decide(
+            REQUEST_ID,
+            plan_hash=waiting.plan_hash or "",
+            approver_id="approver-1",
+            decision="approve",
+            reason="Approved for retry test",
+        )
+
+    pending = await graph.get(REQUEST_ID)
+    assert pending.status == "APPROVED_PENDING_REVALIDATION"
+
+    completed = await graph.decide(
+        REQUEST_ID,
+        plan_hash=waiting.plan_hash or "",
+        approver_id="approver-1",
+        decision="approve",
+        reason="Approved for retry test",
+    )
+
+    assert completed.status == "APPROVED_NO_WRITE"
+    assert builder.await_count == 3
 
 
 @pytest.mark.anyio
@@ -273,4 +345,4 @@ async def test_sqlite_checkpoint_survives_runtime_restart(tmp_path) -> None:
 
     assert restored == waiting
     assert approved.status == "APPROVED_NO_WRITE"
-    builder.assert_awaited_once()
+    assert builder.await_count == 2

@@ -316,6 +316,16 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(exc),
             ) from None
+        except ERPNextConfigurationError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ERPNext integration is not configured",
+            ) from None
+        except (ERPNextDataError, ValidationError, httpx.HTTPError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="ERPNext revalidation failed safely; retry the same decision",
+            ) from None
 
     return application
 

@@ -301,6 +301,20 @@ is exposed through authenticated FastAPI start/status/decision routes. The
 requester and approver use distinct configured API keys; the decision request
 cannot assert its own approver identity or timestamp.
 
+An approval now routes through a second execution of the complete read-only
+proposal builder. If the canonical result differs, the graph terminates at
+`STALE_REPLAN_REQUIRED` and the old approval cannot continue. An unchanged plan
+terminates at `APPROVED_NO_WRITE`. A temporary read failure leaves the recorded
+approval at `APPROVED_PENDING_REVALIDATION`, where only the exact same approval
+can retry the safe read.
+
+On 2026-09-03, the repeatable `erpnext_agentic.check_workflow` smoke check used
+the live development fixture to produce the expected 20 `Nos` proposal, paused,
+reconstructed the FastAPI application, restored the SQLite checkpoint, and
+resumed to `APPROVED_NO_WRITE`. The post-approval ERPNext read produced the same
+plan hash. The check used temporary platform credentials and a temporary
+checkpoint and performed no ERPNext mutation.
+
 ## 15. Evidence consulted
 
 Installed source in `frappe/erpnext:v16.26.2`:

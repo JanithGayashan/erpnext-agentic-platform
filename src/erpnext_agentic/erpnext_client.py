@@ -1,11 +1,12 @@
 import json
+from datetime import date
 from decimal import Decimal
 from types import TracebackType
-from typing import Self
+from typing import Literal, Self
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from erpnext_agentic.config import Settings
 
@@ -147,6 +148,67 @@ class StockPosition(BaseModel):
     warehouse: str
     projected_qty: Decimal
     bin_record: BinRecord | None
+
+
+class MaterialRequestItemRecord(BaseModel):
+    """Typed fields read from one Material Request Item row."""
+
+    name: str = Field(min_length=1)
+    idx: int = Field(ge=1)
+    item_code: str = Field(min_length=1)
+    item_name: str = Field(min_length=1)
+    item_group: str = Field(min_length=1)
+    qty: Decimal = Field(gt=0)
+    stock_qty: Decimal = Field(gt=0)
+    uom: str = Field(min_length=1)
+    stock_uom: str = Field(min_length=1)
+    conversion_factor: Decimal = Field(gt=0)
+    warehouse: str | None = None
+    schedule_date: date
+    ordered_qty: Decimal = Field(ge=0)
+    received_qty: Decimal = Field(ge=0)
+
+
+class MaterialRequestRecord(BaseModel):
+    """Typed read-only Material Request snapshot used by later policy code."""
+
+    name: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    modified: str = Field(min_length=1)
+    docstatus: Literal[0, 1, 2]
+    status: str = Field(min_length=1)
+    material_request_type: str = Field(min_length=1)
+    company: str = Field(min_length=1)
+    transaction_date: date
+    schedule_date: date
+    auto_created_via_reorder: bool
+    items: list[MaterialRequestItemRecord] = Field(min_length=1)
+
+
+class MaterialRequestResourceResponse(BaseModel):
+    """Validated response from one Material Request resource endpoint."""
+
+    data: MaterialRequestRecord
+
+
+class AutoReorderMaterialRequestRecord(BaseModel):
+    """Small discovery record for a submitted ERPNext auto-reorder request."""
+
+    name: str = Field(min_length=1)
+    modified: str = Field(min_length=1)
+    docstatus: Literal[0, 1, 2]
+    status: str = Field(min_length=1)
+    material_request_type: str = Field(min_length=1)
+    company: str = Field(min_length=1)
+    transaction_date: date
+    schedule_date: date
+    auto_created_via_reorder: bool
+
+
+class AutoReorderMaterialRequestListResponse(BaseModel):
+    """Validated list response for ERPNext-created reorder requests."""
+
+    data: list[AutoReorderMaterialRequestRecord]
 
 
 class ERPNextClient:
@@ -397,3 +459,86 @@ class ERPNextClient:
             raise ERPNextDataError("UOM is disabled")
 
         return record
+
+    async def get_material_request(self, name: str) -> MaterialRequestRecord:
+        """Read one exact Material Request and reduce it to typed safe fields."""
+
+        encoded_name = quote(name, safe="")
+        response = await self._client.get(
+            f"api/resource/Material%20Request/{encoded_name}"
+        )
+        response.raise_for_status()
+        record = MaterialRequestResourceResponse.model_validate_json(
+            response.content
+        ).data
+
+        if record.name != name:
+            raise ERPNextDataError(
+                "ERPNext returned an unexpected Material Request"
+            )
+
+        return record
+
+    async def get_recent_auto_reorder_material_requests(
+        self,
+        *,
+        company: str,
+        limit: int = 20,
+    ) -> list[AutoReorderMaterialRequestRecord]:
+        """Discover recent submitted Purchase requests created by ERPNext reorder."""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+
+        response = await self._client.get(
+            "api/resource/Material%20Request",
+            params={
+                "fields": json.dumps(
+                    [
+                        "name",
+                        "modified",
+                        "docstatus",
+                        "status",
+                        "material_request_type",
+                        "company",
+                        "transaction_date",
+                        "schedule_date",
+                        "auto_created_via_reorder",
+                    ]
+                ),
+                "filters": json.dumps(
+                    [
+                        ["company", "=", company],
+                        ["material_request_type", "=", "Purchase"],
+                        ["auto_created_via_reorder", "=", 1],
+                        ["docstatus", "=", 1],
+                    ]
+                ),
+                "order_by": "modified desc",
+                "limit_page_length": str(limit),
+            },
+        )
+        response.raise_for_status()
+        records = AutoReorderMaterialRequestListResponse.model_validate_json(
+            response.content
+        ).data
+
+        for record in records:
+            if record.company != company:
+                raise ERPNextDataError(
+                    "ERPNext returned an auto-reorder request for another Company"
+                )
+            if record.material_request_type != "Purchase":
+                raise ERPNextDataError(
+                    "ERPNext returned a non-Purchase auto-reorder request"
+                )
+            if not record.auto_created_via_reorder:
+                raise ERPNextDataError(
+                    "ERPNext returned a request not created by automatic reorder"
+                )
+            if record.docstatus != 1:
+                raise ERPNextDataError(
+                    "ERPNext returned an auto-reorder request that is not submitted"
+                )
+
+        return records

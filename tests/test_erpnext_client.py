@@ -1,4 +1,6 @@
 import asyncio
+from datetime import date
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -563,5 +565,223 @@ def test_get_uom_rejects_invalid_result(
         async with ERPNextClient(configured_settings(), transport=transport) as client:
             with pytest.raises(ERPNextDataError, match=expected_message):
                 await client.get_uom("Nos")
+
+    asyncio.run(run_test())
+
+
+def material_request_response(
+    *,
+    name: str = "MAT-MR-2026-00001",
+) -> dict[str, object]:
+    return {
+        "data": {
+            "name": name,
+            "title": "Agentic Lead-Time Risk Test",
+            "modified": "2026-09-03 14:10:00.000000",
+            "docstatus": 0,
+            "status": "Draft",
+            "material_request_type": "Purchase",
+            "company": "JG Investors (Demo)",
+            "transaction_date": "2026-09-03",
+            "schedule_date": "2026-09-04",
+            "auto_created_via_reorder": 0,
+            "items": [
+                {
+                    "name": "MR-ITEM-00001",
+                    "idx": 1,
+                    "item_code": "AGENTIC-TEST-ITEM",
+                    "item_name": "Agentic Test Item",
+                    "item_group": "Agentic Test Items",
+                    "qty": 20,
+                    "stock_qty": 20,
+                    "uom": "Nos",
+                    "stock_uom": "Nos",
+                    "conversion_factor": 1,
+                    "warehouse": "Agentic Test Warehouse - JGD",
+                    "schedule_date": "2026-09-04",
+                    "ordered_qty": 0,
+                    "received_qty": 0,
+                    "ignored_child_field": "not checkpointed",
+                }
+            ],
+            "ignored_header_field": "not checkpointed",
+        }
+    }
+
+
+def test_get_material_request_reads_exact_typed_resource() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/api/resource/Material Request/MAT-MR-2026-00001"
+        )
+        return httpx.Response(200, json=material_request_response())
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            material_request = await client.get_material_request(
+                "MAT-MR-2026-00001"
+            )
+
+        assert material_request.name == "MAT-MR-2026-00001"
+        assert material_request.docstatus == 0
+        assert material_request.transaction_date == date(2026, 9, 3)
+        assert material_request.schedule_date == date(2026, 9, 4)
+        assert len(material_request.items) == 1
+        assert material_request.items[0].qty == Decimal("20")
+        assert material_request.items[0].stock_uom == "Nos"
+        assert not hasattr(material_request, "ignored_header_field")
+        assert not hasattr(material_request.items[0], "ignored_child_field")
+
+    asyncio.run(run_test())
+
+
+def auto_reorder_material_request_response(
+    **overrides: object,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "name": "MAT-MR-2026-00003",
+        "modified": "2026-09-03 15:00:00.000000",
+        "docstatus": 1,
+        "status": "Pending",
+        "material_request_type": "Purchase",
+        "company": "JG Investors (Demo)",
+        "transaction_date": "2026-09-03",
+        "schedule_date": "2026-09-06",
+        "auto_created_via_reorder": 1,
+        "ignored_field": "not retained",
+    }
+    record.update(overrides)
+    return {"data": [record]}
+
+
+def test_get_recent_auto_reorder_material_requests_uses_safe_filters() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/resource/Material Request"
+        assert request.url.params["fields"] == (
+            '["name", "modified", "docstatus", "status", '
+            '"material_request_type", "company", "transaction_date", '
+            '"schedule_date", "auto_created_via_reorder"]'
+        )
+        assert request.url.params["filters"] == (
+            '[["company", "=", "JG Investors (Demo)"], '
+            '["material_request_type", "=", "Purchase"], '
+            '["auto_created_via_reorder", "=", 1], ["docstatus", "=", 1]]'
+        )
+        assert request.url.params["order_by"] == "modified desc"
+        assert request.url.params["limit_page_length"] == "10"
+        return httpx.Response(200, json=auto_reorder_material_request_response())
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            records = await client.get_recent_auto_reorder_material_requests(
+                company="JG Investors (Demo)",
+                limit=10,
+            )
+
+        assert len(records) == 1
+        assert records[0].name == "MAT-MR-2026-00003"
+        assert records[0].docstatus == 1
+        assert records[0].auto_created_via_reorder is True
+        assert not hasattr(records[0], "ignored_field")
+
+    asyncio.run(run_test())
+
+
+def test_get_recent_auto_reorder_material_requests_accepts_empty_result() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            records = await client.get_recent_auto_reorder_material_requests(
+                company="JG Investors (Demo)"
+            )
+
+        assert records == []
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_message"),
+    [
+        ({"company": "Other Company"}, "another Company"),
+        ({"material_request_type": "Material Transfer"}, "non-Purchase"),
+        ({"auto_created_via_reorder": 0}, "not created by automatic reorder"),
+        ({"docstatus": 0}, "not submitted"),
+    ],
+)
+def test_get_recent_auto_reorder_material_requests_revalidates_server_filters(
+    overrides: dict[str, object],
+    expected_message: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=auto_reorder_material_request_response(**overrides),
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            with pytest.raises(ERPNextDataError, match=expected_message):
+                await client.get_recent_auto_reorder_material_requests(
+                    company="JG Investors (Demo)"
+                )
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_get_recent_auto_reorder_material_requests_rejects_unsafe_limit(
+    limit: int,
+) -> None:
+    async def run_test() -> None:
+        async with ERPNextClient(configured_settings()) as client:
+            with pytest.raises(ValueError, match="between 1 and 100"):
+                await client.get_recent_auto_reorder_material_requests(
+                    company="JG Investors (Demo)",
+                    limit=limit,
+                )
+
+    asyncio.run(run_test())
+
+
+def test_get_material_request_percent_encodes_document_name() -> None:
+    requested_name = "MR/Test 01"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.raw_path == b"/api/resource/Material%20Request/MR%2FTest%2001"
+        return httpx.Response(
+            200,
+            json=material_request_response(name=requested_name),
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            result = await client.get_material_request(requested_name)
+            assert result.name == requested_name
+
+    asyncio.run(run_test())
+
+
+def test_get_material_request_rejects_mismatched_document() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=material_request_response(name="MAT-MR-2026-OTHER"),
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            with pytest.raises(ERPNextDataError, match="unexpected Material Request"):
+                await client.get_material_request("MAT-MR-2026-00001")
 
     asyncio.run(run_test())

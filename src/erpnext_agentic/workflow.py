@@ -29,7 +29,9 @@ WorkflowStatus = Literal[
     "PLANNING",
     "AWAITING_APPROVAL",
     "NO_ACTION",
+    "APPROVED_PENDING_REVALIDATION",
     "APPROVED_NO_WRITE",
+    "STALE_REPLAN_REQUIRED",
     "REJECTED",
 ]
 ApprovalChoice = Literal["approve", "reject"]
@@ -66,6 +68,9 @@ class WorkflowState(TypedDict, total=False):
     approval_requested_at: str
     approval_expires_at: str
     approval: dict[str, Any]
+    revalidation_proposal: dict[str, Any]
+    revalidation_plan_hash: str
+    revalidated_at: str
     status_reason: str
 
 
@@ -114,6 +119,9 @@ class WorkflowSnapshot(BaseModel):
     approval_requested_at: datetime | None = None
     approval_expires_at: datetime | None = None
     approval: ApprovalRecord | None = None
+    revalidation_proposal: ProposalResponse | None = None
+    revalidation_plan_hash: str | None = None
+    revalidated_at: datetime | None = None
     status_reason: str | None = None
     waiting_for_approval: bool
 
@@ -237,19 +245,53 @@ def build_replenishment_workflow(
         elif decision.decision == "reject":
             result["status"] = "REJECTED"
         else:
+            result["status"] = "APPROVED_PENDING_REVALIDATION"
+        return result
+
+    def route_after_approval(state: WorkflowState) -> str:
+        if state["status"] == "APPROVED_PENDING_REVALIDATION":
+            return "revalidate_proposal"
+        return "finish"
+
+    async def revalidate_proposal(state: WorkflowState) -> WorkflowState:
+        request = ProposalRequest.model_validate(state["request"])
+        current_proposal = await proposal_builder(
+            settings,
+            request,
+            requester_id=state["requester_id"],
+        )
+        current_data = current_proposal.model_dump(mode="json")
+        current_hash = _canonical_plan_hash(current_data)
+        result: WorkflowState = {
+            "revalidation_proposal": current_data,
+            "revalidation_plan_hash": current_hash,
+            "revalidated_at": _as_utc(clock()).isoformat(),
+        }
+        if not compare_digest(current_hash, state["plan_hash"]):
             result.update(
                 {
-                    "status": "APPROVED_NO_WRITE",
+                    "status": "STALE_REPLAN_REQUIRED",
                     "status_reason": (
-                        "Approval recorded; ERPNext mutation is not implemented"
+                        "ERPNext data changed after approval; create a new plan"
                     ),
                 }
             )
+            return result
+
+        result.update(
+            {
+                "status": "APPROVED_NO_WRITE",
+                "status_reason": (
+                    "Approved plan revalidated; ERPNext mutation is not implemented"
+                ),
+            }
+        )
         return result
 
     graph = StateGraph(WorkflowState)
     graph.add_node("build_proposal", build_proposal)
     graph.add_node("request_approval", request_approval)
+    graph.add_node("revalidate_proposal", revalidate_proposal)
     graph.add_edge(START, "build_proposal")
     graph.add_conditional_edges(
         "build_proposal",
@@ -259,7 +301,15 @@ def build_replenishment_workflow(
             "finish": END,
         },
     )
-    graph.add_edge("request_approval", END)
+    graph.add_conditional_edges(
+        "request_approval",
+        route_after_approval,
+        {
+            "revalidate_proposal": "revalidate_proposal",
+            "finish": END,
+        },
+    )
+    graph.add_edge("revalidate_proposal", END)
     return graph.compile(
         checkpointer=checkpointer,
         name="replenishment_approval",
@@ -328,8 +378,6 @@ class ReplenishmentApprovalWorkflow:
         """Resume a matching approval interrupt; this never writes to ERPNext."""
 
         current = await self.get(request_id)
-        if not current.waiting_for_approval or current.status != "AWAITING_APPROVAL":
-            raise WorkflowStateError("Workflow is not awaiting approval")
         if current.plan_hash is None or not compare_digest(
             current.plan_hash,
             plan_hash,
@@ -344,6 +392,26 @@ class ReplenishmentApprovalWorkflow:
             raise SelfApprovalError(
                 "Requester and approver must be different identities"
             )
+
+        if current.status == "APPROVED_PENDING_REVALIDATION":
+            recorded = current.approval
+            if (
+                recorded is None
+                or recorded.approver_id != approver_id
+                or recorded.decision != decision
+                or recorded.reason != reason
+            ):
+                raise WorkflowStateError(
+                    "Revalidation retry must match the recorded approval"
+                )
+            await self._graph.ainvoke(
+                None,
+                config=_thread_config(request_id),
+            )
+            return await self.get(request_id)
+
+        if not current.waiting_for_approval or current.status != "AWAITING_APPROVAL":
+            raise WorkflowStateError("Workflow is not awaiting approval")
 
         approval = ApprovalDecision(
             request_id=request_id,
@@ -388,6 +456,13 @@ class ReplenishmentApprovalWorkflow:
                 if "approval" in values
                 else None
             ),
+            revalidation_proposal=(
+                ProposalResponse.model_validate(values["revalidation_proposal"])
+                if "revalidation_proposal" in values
+                else None
+            ),
+            revalidation_plan_hash=values.get("revalidation_plan_hash"),
+            revalidated_at=values.get("revalidated_at"),
             status_reason=values.get("status_reason"),
             waiting_for_approval=bool(state.interrupts),
         )

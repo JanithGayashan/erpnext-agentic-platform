@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
 from erpnext_agentic.config import Settings
+from erpnext_agentic.erpnext_client import ERPNextDataError
 from erpnext_agentic.main import create_app
 from erpnext_agentic.proposal_service import ProposalResponse
 from erpnext_agentic.replenishment import ReplenishmentProposal
@@ -67,16 +68,17 @@ def proposal_response() -> ProposalResponse:
 def build_test_app(
     *,
     settings: Settings | None = None,
+    builder: AsyncMock | None = None,
 ) -> tuple[object, AsyncMock]:
     resolved_settings = settings or endpoint_settings()
-    builder = AsyncMock(return_value=proposal_response())
+    resolved_builder = builder or AsyncMock(return_value=proposal_response())
     workflow = ReplenishmentApprovalWorkflow(
         resolved_settings,
         InMemorySaver(),
-        proposal_builder=builder,
+        proposal_builder=resolved_builder,
         clock=lambda: NOW,
     )
-    return create_app(resolved_settings, workflow=workflow), builder
+    return create_app(resolved_settings, workflow=workflow), resolved_builder
 
 
 def test_workflow_start_requires_requester_authentication() -> None:
@@ -124,7 +126,8 @@ def test_http_workflow_can_start_be_inspected_and_be_approved() -> None:
     assert approved.json()["waiting_for_approval"] is False
     assert approved.json()["approval"]["approver_id"] == "approver-1"
     assert approved.json()["approval"]["reason"] == "Reviewed test proposal"
-    builder.assert_awaited_once()
+    assert approved.json()["revalidation_plan_hash"] == plan_hash
+    assert builder.await_count == 2
 
 
 def test_requester_key_cannot_approve() -> None:
@@ -171,6 +174,47 @@ def test_mismatched_plan_hash_returns_conflict_and_remains_paused() -> None:
     assert response.status_code == 409
     assert unchanged.json()["status"] == "AWAITING_APPROVAL"
     assert unchanged.json()["waiting_for_approval"] is True
+
+
+def test_revalidation_read_failure_can_retry_same_http_decision() -> None:
+    builder = AsyncMock(
+        side_effect=[
+            proposal_response(),
+            ERPNextDataError("temporary read failure"),
+            proposal_response(),
+        ]
+    )
+    app, _ = build_test_app(builder=builder)
+
+    with TestClient(app) as client:
+        started = client.post(
+            "/replenishment/workflows",
+            json=REQUEST_BODY,
+            headers=REQUESTER_HEADERS,
+        ).json()
+        decision_body = {
+            "plan_hash": started["plan_hash"],
+            "decision": "approve",
+            "reason": "Retry the safe read",
+        }
+        failed = client.post(
+            f"/replenishment/workflows/{REQUEST_ID}/decision",
+            headers=APPROVER_HEADERS,
+            json=decision_body,
+        )
+        retried = client.post(
+            f"/replenishment/workflows/{REQUEST_ID}/decision",
+            headers=APPROVER_HEADERS,
+            json=decision_body,
+        )
+
+    assert failed.status_code == 502
+    assert failed.json() == {
+        "detail": "ERPNext revalidation failed safely; retry the same decision"
+    }
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "APPROVED_NO_WRITE"
+    assert builder.await_count == 3
 
 
 def test_unknown_workflow_returns_not_found() -> None:

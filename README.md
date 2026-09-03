@@ -1,8 +1,13 @@
 # ERPNext Agentic Platform
 
 A separate, approval-gated workflow service that integrates with ERPNext only
-through authenticated ERPNext APIs. See [the project brief](docs/project-brief.md)
-and [the first milestone](docs/first-milestone.md) for the current scope.
+through authenticated ERPNext APIs. See [the project brief](docs/project-brief.md),
+[the first milestone](docs/first-milestone.md), and the
+[next-use-case decision](docs/next-use-case.md) for the current scope. The
+provisional read-only follow-up is specified in
+[the second milestone](docs/second-milestone.md).
+The current integration direction is documented in
+[the built-in reorder integration decision](docs/builtin-reorder-integration.md).
 
 ## Current implementation
 
@@ -12,6 +17,10 @@ The current foundation contains:
 - a FastAPI application factory with `GET /health`;
 - an authenticated, read-only `POST /replenishment/proposals` endpoint;
 - a typed ERPNext API client and deterministic replenishment calculation;
+- typed, read-only Material Request header and Item-row retrieval for the
+  provisional second milestone;
+- typed, read-only discovery of submitted Purchase Material Requests that
+  ERPNext marks as automatically created through reorder;
 - a typed LangGraph approval workflow with plan hashing, expiry, rejection,
   self-approval protection, and request-ID reuse checks;
 - authenticated FastAPI routes to start, inspect, approve, or reject that
@@ -62,7 +71,9 @@ that timezone, and `schedule_date` adds the Item's non-negative lead time.
 ```text
 PLANNING -> NO_ACTION
          -> AWAITING_APPROVAL -> REJECTED
-                              -> APPROVED_NO_WRITE
+                              -> APPROVED_PENDING_REVALIDATION
+                                 -> STALE_REPLAN_REQUIRED
+                                 -> APPROVED_NO_WRITE
 ```
 
 The graph calls the existing read-only proposal builder, hashes its canonical
@@ -70,7 +81,9 @@ typed result, and pauses with a LangGraph interrupt. The same `request_id` is th
 checkpoint thread ID. Approval must reference the exact hash, comes from a
 different identity by default, and expires after 30 minutes by default. Local
 SQLite checkpoints are ignored by Git. No LLM is needed for this deterministic
-workflow.
+workflow. After approval, the graph performs the same ERPNext reads again and
+recomputes the canonical plan hash. Changed data cannot continue under the old
+approval.
 
 The workflow HTTP surface is:
 
@@ -86,9 +99,24 @@ from the service; callers cannot supply either field. Configure a distinct
 `APP_PLATFORM_APPROVER_ID` and `APP_PLATFORM_APPROVER_API_KEY` only in the
 ignored `.env` before a live HTTP test.
 
-The next step is to exercise these routes against the live development ERPNext
-fixture and verify SQLite resume through an application restart. ERPNext draft
-creation remains a later, separately tested step.
+Exercise the routes against the live development ERPNext fixture and verify
+SQLite resume through an application restart with:
+
+```powershell
+python -m erpnext_agentic.check_workflow
+```
+
+The command uses the ERPNext credentials already stored in `.env`, but creates
+temporary requester/approver keys and a temporary SQLite checkpoint. It starts a
+real read-only proposal through the FastAPI route, reconstructs the application,
+restores the approval wait, and resumes to `APPROVED_NO_WRITE`. The test-only
+automatic approval in this command must never be reused for a workflow that has
+an ERPNext write node.
+
+If post-approval ERPNext reads fail, the approval remains checkpointed as
+`APPROVED_PENDING_REVALIDATION`; retrying the exact same decision retries only
+the safe read. The next project decision is to select a real workflow gap that
+ERPNext does not already solve before adding any write capability.
 
 ## Local setup
 
