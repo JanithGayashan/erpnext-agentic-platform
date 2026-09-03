@@ -31,8 +31,22 @@ exact Item resource is required to obtain its child table and is reduced to a
 typed model on receipt. Finally, it reads the exact Item/Warehouse Bin and uses
 ERPNext's stored projected quantity; a missing Bin is normalized to zero for the
 documented first-milestone rule. A pure deterministic function then calculates
-`PROPOSAL` or `NO_ACTION`; this result does not authorize a write. The service
-does not perform any mutation.
+`PROPOSAL` or `NO_ACTION`. The Item's enabled UOM is also validated, and proposed
+quantities are rounded upward when ERPNext marks that UOM as whole-number-only.
+This result does not authorize a write. The service does not perform any mutation.
+
+## Read-only proposal endpoint
+
+`POST /replenishment/proposals` accepts a typed Company, Item, Warehouse, and
+caller-generated request UUID. It authenticates the caller through a separate
+`X-API-Key`; requester identity comes from that authentication and is not
+accepted in the request body. The endpoint performs ERPNext reads and returns a
+calculation only. The request ID is not persisted yet, so this is not the later
+resumable or idempotent LangGraph workflow.
+
+Proposal dates use the timezone returned by Frappe's supported
+`frappe.client.get_time_zone` method. `transaction_date` is the current date in
+that timezone, and `schedule_date` adds the Item's non-negative lead time.
 
 ## Local setup
 

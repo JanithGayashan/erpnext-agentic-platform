@@ -24,6 +24,18 @@ class LoggedUserResponse(BaseModel):
     message: str
 
 
+class TimeZoneDetails(BaseModel):
+    """Site timezone returned by Frappe."""
+
+    time_zone: str
+
+
+class TimeZoneResponse(BaseModel):
+    """Validated response from Frappe's timezone method."""
+
+    message: TimeZoneDetails
+
+
 class CompanyRecord(BaseModel):
     """Company fields required by the first milestone."""
 
@@ -91,6 +103,21 @@ class ValidatedItemReorder(BaseModel):
 
     item: ItemRecord
     reorder_rule: ItemReorderRecord
+
+
+class UOMRecord(BaseModel):
+    """Unit-of-measure rules required by the first milestone."""
+
+    name: str
+    uom_name: str
+    must_be_whole_number: bool
+    enabled: bool
+
+
+class UOMListResponse(BaseModel):
+    """Validated list response from the UOM resource endpoint."""
+
+    data: list[UOMRecord]
 
 
 class BinRecord(BaseModel):
@@ -171,6 +198,13 @@ class ERPNextClient:
         response = await self._client.get("api/method/frappe.auth.get_logged_user")
         response.raise_for_status()
         return LoggedUserResponse.model_validate_json(response.content).message
+
+    async def get_time_zone(self) -> str:
+        """Return the ERPNext site's configured IANA timezone name."""
+
+        response = await self._client.get("api/method/frappe.client.get_time_zone")
+        response.raise_for_status()
+        return TimeZoneResponse.model_validate_json(response.content).message.time_zone
 
     async def get_company(self, company: str) -> CompanyRecord:
         """Read one exact Company using an explicit field allowlist."""
@@ -336,3 +370,30 @@ class ERPNextClient:
             projected_qty=record.projected_qty,
             bin_record=record,
         )
+
+    async def get_uom(self, uom: str) -> UOMRecord:
+        """Read and validate the Item's enabled stock UOM."""
+
+        response = await self._client.get(
+            "api/resource/UOM",
+            params={
+                "fields": json.dumps(
+                    ["name", "uom_name", "must_be_whole_number", "enabled"]
+                ),
+                "filters": json.dumps([["name", "=", uom]]),
+                "limit_page_length": "2",
+            },
+        )
+        response.raise_for_status()
+        records = UOMListResponse.model_validate_json(response.content).data
+
+        if len(records) != 1 or records[0].name != uom:
+            raise ERPNextDataError("ERPNext did not return exactly the requested UOM")
+
+        record = records[0]
+        if record.uom_name != uom:
+            raise ERPNextDataError("ERPNext returned a mismatched UOM name")
+        if not record.enabled:
+            raise ERPNextDataError("UOM is disabled")
+
+        return record

@@ -40,6 +40,23 @@ def test_get_logged_user_uses_authenticated_site_request() -> None:
     asyncio.run(run_test())
 
 
+def test_get_time_zone_uses_supported_frappe_method() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/method/frappe.client.get_time_zone"
+        return httpx.Response(
+            200,
+            json={"message": {"time_zone": "Asia/Colombo"}},
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            assert await client.get_time_zone() == "Asia/Colombo"
+
+    asyncio.run(run_test())
+
+
 def test_client_refuses_missing_credentials() -> None:
     settings = Settings(
         environment="test",
@@ -469,5 +486,82 @@ def test_get_stock_position_rejects_mismatched_bin() -> None:
                     "AGENTIC-TEST-ITEM",
                     warehouse="Agentic Test Warehouse - JGD",
                 )
+
+    asyncio.run(run_test())
+
+
+def test_get_uom_requests_and_validates_required_fields() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/resource/UOM"
+        assert request.url.params["fields"] == (
+            '["name", "uom_name", "must_be_whole_number", "enabled"]'
+        )
+        assert request.url.params["filters"] == '[["name", "=", "Nos"]]'
+        assert request.url.params["limit_page_length"] == "2"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "name": "Nos",
+                        "uom_name": "Nos",
+                        "must_be_whole_number": 1,
+                        "enabled": 1,
+                    }
+                ]
+            },
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            uom = await client.get_uom("Nos")
+            assert uom.enabled is True
+            assert uom.must_be_whole_number is True
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("records", "expected_message"),
+    [
+        ([], "exactly the requested UOM"),
+        (
+            [
+                {
+                    "name": "Nos",
+                    "uom_name": "Nos",
+                    "must_be_whole_number": 1,
+                    "enabled": 0,
+                }
+            ],
+            "disabled",
+        ),
+        (
+            [
+                {
+                    "name": "Nos",
+                    "uom_name": "Different",
+                    "must_be_whole_number": 1,
+                    "enabled": 1,
+                }
+            ],
+            "mismatched UOM name",
+        ),
+    ],
+)
+def test_get_uom_rejects_invalid_result(
+    records: list[dict[str, object]],
+    expected_message: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": records})
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            with pytest.raises(ERPNextDataError, match=expected_message):
+                await client.get_uom("Nos")
 
     asyncio.run(run_test())

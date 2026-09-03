@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     name: str = "ERPNext Agentic Platform"
     environment: Literal["development", "test", "production"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    platform_requester_id: str = "local-developer"
+    platform_api_key: SecretStr | None = None
     erpnext_base_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8000")
     erpnext_site_host: str = "development.localhost"
     erpnext_expected_user: str = "agentic-api@jg-investors.test"
