@@ -6,14 +6,21 @@ and [the first milestone](docs/first-milestone.md) for the current scope.
 
 ## Current implementation
 
-The first foundation contains only:
+The current foundation contains:
 
 - validated application configuration;
-- a FastAPI application factory;
-- `GET /health`;
-- an automated health-endpoint test.
+- a FastAPI application factory with `GET /health`;
+- an authenticated, read-only `POST /replenishment/proposals` endpoint;
+- a typed ERPNext API client and deterministic replenishment calculation;
+- a typed LangGraph approval workflow with plan hashing, expiry, rejection,
+  self-approval protection, and request-ID reuse checks;
+- authenticated FastAPI routes to start, inspect, approve, or reject that
+  workflow using separate requester and approver credentials;
+- a persistent SQLite checkpoint option for local development;
+- automated unit, API, workflow-interrupt, and restart-persistence tests.
 
-It does not yet run LangGraph, read stock/reorder documents, or perform writes.
+An approved workflow ends as `APPROVED_NO_WRITE`; it cannot create, submit, or
+otherwise mutate an ERPNext document.
 
 The first read-only connection check is available after configuring the
 dedicated API credentials in `.env`:
@@ -41,12 +48,47 @@ This result does not authorize a write. The service does not perform any mutatio
 caller-generated request UUID. It authenticates the caller through a separate
 `X-API-Key`; requester identity comes from that authentication and is not
 accepted in the request body. The endpoint performs ERPNext reads and returns a
-calculation only. The request ID is not persisted yet, so this is not the later
-resumable or idempotent LangGraph workflow.
+calculation only. This endpoint is still separate from the new checkpointed
+LangGraph workflow.
 
 Proposal dates use the timezone returned by Frappe's supported
 `frappe.client.get_time_zone` method. `transaction_date` is the current date in
 that timezone, and `schedule_date` adds the Item's non-negative lead time.
+
+## Current LangGraph step
+
+`erpnext_agentic.workflow` now supplies the first resumable orchestration layer:
+
+```text
+PLANNING -> NO_ACTION
+         -> AWAITING_APPROVAL -> REJECTED
+                              -> APPROVED_NO_WRITE
+```
+
+The graph calls the existing read-only proposal builder, hashes its canonical
+typed result, and pauses with a LangGraph interrupt. The same `request_id` is the
+checkpoint thread ID. Approval must reference the exact hash, comes from a
+different identity by default, and expires after 30 minutes by default. Local
+SQLite checkpoints are ignored by Git. No LLM is needed for this deterministic
+workflow.
+
+The workflow HTTP surface is:
+
+| Route | Authentication | Purpose |
+|---|---|---|
+| `POST /replenishment/workflows` | Requester key | Build or return the checkpointed proposal. |
+| `GET /replenishment/workflows/{request_id}` | Requester or approver key | Inspect the current state and exact plan hash. |
+| `POST /replenishment/workflows/{request_id}/decision` | Approver key | Resume with `approve` or `reject`. |
+
+The decision body contains only `plan_hash`, `decision`, and an optional
+`reason`. Approver identity comes from authentication and decision time comes
+from the service; callers cannot supply either field. Configure a distinct
+`APP_PLATFORM_APPROVER_ID` and `APP_PLATFORM_APPROVER_API_KEY` only in the
+ignored `.env` before a live HTTP test.
+
+The next step is to exercise these routes against the live development ERPNext
+fixture and verify SQLite resume through an application restart. ERPNext draft
+creation remains a later, separately tested step.
 
 ## Local setup
 

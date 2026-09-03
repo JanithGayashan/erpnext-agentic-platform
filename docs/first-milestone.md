@@ -1,8 +1,8 @@
 # First Milestone — Approval-Gated Replenishment Draft
 
-**Status:** Draft specification; minimal FastAPI health/configuration foundation implemented, but no ERPNext workflow code yet.  
+**Status:** In progress; read-only ERPNext proposal path and the persistent LangGraph approval workflow API are implemented. No ERPNext mutation exists yet.
 **Depends on:** [`project-brief.md`](./project-brief.md)  
-**Last reviewed:** 2026-08-29
+**Last reviewed:** 2026-09-03
 
 ## 1. Objective
 
@@ -282,11 +282,26 @@ The milestone is complete only when automated tests and a non-production API tes
 
 - Inspect the site's timezone, active Material Request naming series, and any custom workflows or required custom fields before the first write test.
 - Choose the platform requester/approver identities and decide whether they may be the same person during local development.
-- Select the checkpoint/audit store and approval expiry.
+- SQLite and a configurable 30-minute approval expiry are selected for the local single-process proof. Select the production checkpoint/audit store, retention, and encryption policy before deployment.
 - Decide whether service-created draft deduplication is sufficient or a globally queryable ERPNext operation reference is required.
 - Confirm the remaining API v1 UOM and Material Request read schemas before attempting the one approved draft write.
 
-## 14. Evidence consulted
+## 14. Implementation checkpoint — first LangGraph slice
+
+The initial graph now uses the existing read-only proposal builder as its first
+node, stores JSON-safe typed state under the request UUID, computes a canonical
+SHA-256 plan hash, and pauses with an approval interrupt. It rejects mismatched
+plan hashes, self-approval by default, expired approvals, repeated terminal
+decisions, and reuse of a request ID for different intent or identity.
+
+The local runtime can persist checkpoints in an ignored SQLite file and has an
+automated close/reopen/resume test. Approval currently terminates at
+`APPROVED_NO_WRITE`; there is intentionally no ERPNext mutation node. The graph
+is exposed through authenticated FastAPI start/status/decision routes. The
+requester and approver use distinct configured API keys; the decision request
+cannot assert its own approver identity or timestamp.
+
+## 15. Evidence consulted
 
 Installed source in `frappe/erpnext:v16.26.2`:
 
