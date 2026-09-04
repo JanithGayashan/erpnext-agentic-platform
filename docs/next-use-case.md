@@ -3,6 +3,12 @@
 **Status:** Provisional learning selection; production business value is not yet confirmed.
 **Last reviewed:** 2026-09-03
 
+**2026-09-04 update:** The active continuation is now the event-driven Supplier-
+link readiness review in
+[`auto-reorder-event-workflow.md`](./auto-reorder-event-workflow.md). The draft
+lead-time candidate remains paused because ERPNext automatic reorder derives its
+schedule date from the same Item lead-time value.
+
 ## Why selection comes before more code
 
 The replenishment experiment proved the reusable technical boundary: FastAPI

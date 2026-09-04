@@ -211,6 +211,33 @@ class AutoReorderMaterialRequestListResponse(BaseModel):
     data: list[AutoReorderMaterialRequestRecord]
 
 
+class ItemSupplierLink(BaseModel):
+    """One Supplier linked from an ERPNext Item master."""
+
+    supplier: str = Field(min_length=1)
+    supplier_part_no: str | None = None
+
+
+class SourcingItemRecord(BaseModel):
+    """Typed Item fields required by the supplier-readiness policy."""
+
+    name: str = Field(min_length=1)
+    item_name: str = Field(min_length=1)
+    item_group: str = Field(min_length=1)
+    stock_uom: str = Field(min_length=1)
+    disabled: bool
+    is_stock_item: bool
+    has_variants: bool
+    variant_of: str | None = None
+    supplier_items: list[ItemSupplierLink] = Field(default_factory=list)
+
+
+class SourcingItemResourceResponse(BaseModel):
+    """Validated response from one Item resource used for sourcing review."""
+
+    data: SourcingItemRecord
+
+
 class ERPNextClient:
     """Small authenticated client for explicitly allowed ERPNext API calls."""
 
@@ -542,3 +569,26 @@ class ERPNextClient:
                 )
 
         return records
+
+    async def get_sourcing_item(self, item_code: str) -> SourcingItemRecord:
+        """Read one Item and the Supplier links needed for sourcing review."""
+
+        encoded_item_code = quote(item_code, safe="")
+        response = await self._client.get(f"api/resource/Item/{encoded_item_code}")
+        response.raise_for_status()
+        record = SourcingItemResourceResponse.model_validate_json(
+            response.content
+        ).data
+
+        if record.name != item_code:
+            raise ERPNextDataError("ERPNext returned an unexpected sourcing Item")
+        if record.disabled:
+            raise ERPNextDataError("Sourcing Item is disabled")
+        if not record.is_stock_item:
+            raise ERPNextDataError("Sourcing Item is not a stock Item")
+        if record.has_variants or record.variant_of:
+            raise ERPNextDataError(
+                "Sourcing review does not support Item templates or variants"
+            )
+
+        return record

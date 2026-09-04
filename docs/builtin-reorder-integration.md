@@ -1,6 +1,7 @@
 # Built-In Reorder Integration
 
-**Status:** First read-only discovery slice implemented.
+**Status:** Superseded by the secured event-driven sourcing workflow described in
+[`auto-reorder-event-workflow.md`](./auto-reorder-event-workflow.md).
 **Last reviewed:** 2026-09-03
 
 ## Decision
@@ -63,9 +64,9 @@ controls, or a policy involving multiple records.
 - an LLM call;
 - a LangGraph workflow without a distinct business decision.
 
-## Next gate
+## Implemented continuation
 
-Run the read-only discovery against a non-production auto-created request once
-one exists, then choose and document one genuine exception policy. Only after
-that policy has acceptance examples should discovery be connected to a new
-deterministic LangGraph review.
+The service now accepts a signed ERPNext `on_submit` Webhook, re-reads the exact
+auto-created request, checks Item Supplier links, and starts an idempotent,
+checkpointed LangGraph review. The earlier list discovery method remains useful
+for reconciliation, but it is no longer the primary event path.

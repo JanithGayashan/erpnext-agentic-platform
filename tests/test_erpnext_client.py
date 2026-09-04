@@ -785,3 +785,87 @@ def test_get_material_request_rejects_mismatched_document() -> None:
                 await client.get_material_request("MAT-MR-2026-00001")
 
     asyncio.run(run_test())
+
+
+def sourcing_item_response(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "name": "AGENTIC-TEST-ITEM",
+        "item_name": "Agentic Test Item",
+        "item_group": "Agentic Test Items",
+        "stock_uom": "Nos",
+        "disabled": 0,
+        "is_stock_item": 1,
+        "has_variants": 0,
+        "variant_of": None,
+        "supplier_items": [
+            {
+                "supplier": "Agentic Test Supplier",
+                "supplier_part_no": "SUP-PART-001",
+            }
+        ],
+        "ignored_item_field": "not retained",
+    }
+    record.update(overrides)
+    return {"data": record}
+
+
+def test_get_sourcing_item_reads_typed_supplier_links() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/resource/Item/AGENTIC-TEST-ITEM"
+        return httpx.Response(200, json=sourcing_item_response())
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            item = await client.get_sourcing_item("AGENTIC-TEST-ITEM")
+
+        assert item.name == "AGENTIC-TEST-ITEM"
+        assert item.supplier_items[0].supplier == "Agentic Test Supplier"
+        assert item.supplier_items[0].supplier_part_no == "SUP-PART-001"
+        assert not hasattr(item, "ignored_item_field")
+
+    asyncio.run(run_test())
+
+
+def test_get_sourcing_item_accepts_no_supplier_links() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=sourcing_item_response(supplier_items=[]),
+        )
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            item = await client.get_sourcing_item("AGENTIC-TEST-ITEM")
+
+        assert item.supplier_items == []
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_message"),
+    [
+        ({"name": "OTHER-ITEM"}, "unexpected sourcing Item"),
+        ({"disabled": 1}, "disabled"),
+        ({"is_stock_item": 0}, "not a stock Item"),
+        ({"has_variants": 1}, "templates or variants"),
+        ({"variant_of": "ITEM-TEMPLATE"}, "templates or variants"),
+    ],
+)
+def test_get_sourcing_item_rejects_ineligible_item(
+    overrides: dict[str, object],
+    expected_message: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=sourcing_item_response(**overrides))
+
+    async def run_test() -> None:
+        transport = httpx.MockTransport(handler)
+        async with ERPNextClient(configured_settings(), transport=transport) as client:
+            with pytest.raises(ERPNextDataError, match=expected_message):
+                await client.get_sourcing_item("AGENTIC-TEST-ITEM")
+
+    asyncio.run(run_test())

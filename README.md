@@ -8,6 +8,8 @@ provisional read-only follow-up is specified in
 [the second milestone](docs/second-milestone.md).
 The current integration direction is documented in
 [the built-in reorder integration decision](docs/builtin-reorder-integration.md).
+The implemented event flow and ERPNext Webhook configuration are in
+[the auto-reorder event workflow](docs/auto-reorder-event-workflow.md).
 
 ## Current implementation
 
@@ -21,6 +23,12 @@ The current foundation contains:
   provisional second milestone;
 - typed, read-only discovery of submitted Purchase Material Requests that
   ERPNext marks as automatically created through reorder;
+- a Frappe-HMAC-authenticated Webhook endpoint that turns a native submitted
+  auto-reorder Material Request into an idempotent sourcing review;
+- a deterministic Item Supplier-link assessment that adds sourcing-readiness
+  information without selecting or ranking a Supplier;
+- a separate checkpointed LangGraph human-review flow with post-approval
+  ERPNext revalidation and no downstream write;
 - a typed LangGraph approval workflow with plan hashing, expiry, rejection,
   self-approval protection, and request-ID reuse checks;
 - authenticated FastAPI routes to start, inspect, approve, or reject that
@@ -30,6 +38,9 @@ The current foundation contains:
 
 An approved workflow ends as `APPROVED_NO_WRITE`; it cannot create, submit, or
 otherwise mutate an ERPNext document.
+
+The event-driven sourcing review ends as `REVIEWED_NO_WRITE`. ERPNext still owns
+reorder detection, quantity calculation, and Material Request submission.
 
 The first read-only connection check is available after configuring the
 dedicated API credentials in `.env`:
@@ -137,7 +148,7 @@ tests, source code, commits, terminal screenshots, or chat.
 Run the service on port 8001 because the development ERPNext bench uses 8000:
 
 ```powershell
-python -m uvicorn erpnext_agentic.main:app --reload --port 8001
+python -m uvicorn erpnext_agentic.main:app --reload --host 0.0.0.0 --port 8001
 ```
 
 Then open <http://127.0.0.1:8001/health>. The expected response is:

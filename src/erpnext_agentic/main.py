@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
@@ -13,11 +13,32 @@ from erpnext_agentic.erpnext_client import (
     ERPNextConfigurationError,
     ERPNextDataError,
 )
+from erpnext_agentic.frappe_webhook import (
+    MAX_WEBHOOK_BODY_BYTES,
+    AutoReorderWebhookEvent,
+    WebhookSecurityConfigurationError,
+    verify_frappe_webhook_signature,
+)
 from erpnext_agentic.proposal_service import (
     ProposalRequest,
     ProposalResponse,
     ProposalScopeError,
     build_replenishment_proposal,
+)
+from erpnext_agentic.sourcing_review import (
+    AutoReorderReviewRequest,
+    SourcingReviewScopeError,
+    review_id_for_material_request,
+)
+from erpnext_agentic.sourcing_workflow import (
+    AutoReorderSourcingWorkflow,
+    SourcingReviewApprovalMismatchError,
+    SourcingReviewConflictError,
+    SourcingReviewNotFoundError,
+    SourcingReviewSelfApprovalError,
+    SourcingReviewSnapshot,
+    SourcingReviewStateError,
+    open_sqlite_sourcing_workflow,
 )
 from erpnext_agentic.workflow import (
     ApprovalChoice,
@@ -57,10 +78,21 @@ class WorkflowDecisionRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class SourcingReviewDecisionRequest(BaseModel):
+    """Human decision bound to one exact sourcing assessment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assessment_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision: Literal["approve", "reject"]
+    reason: str | None = Field(default=None, max_length=500)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     workflow: ReplenishmentApprovalWorkflow | None = None,
+    sourcing_workflow: AutoReorderSourcingWorkflow | None = None,
 ) -> FastAPI:
     """Build the FastAPI application with explicit configuration."""
 
@@ -70,6 +102,10 @@ def create_app(
         version="0.1.0",
     )
     platform_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+    frappe_signature_header = APIKeyHeader(
+        name="X-Frappe-Webhook-Signature",
+        auto_error=False,
+    )
 
     def require_configured_key(
         configured_api_key: SecretStr | None,
@@ -175,6 +211,15 @@ def create_app(
         async with open_sqlite_workflow(resolved_settings) as durable_workflow:
             yield durable_workflow
 
+    async def provide_sourcing_workflow() -> AsyncIterator[AutoReorderSourcingWorkflow]:
+        if sourcing_workflow is not None:
+            yield sourcing_workflow
+            return
+        async with open_sqlite_sourcing_workflow(
+            resolved_settings
+        ) as durable_sourcing_workflow:
+            yield durable_sourcing_workflow
+
     @application.get("/health", response_model=HealthResponse, tags=["system"])
     async def health() -> HealthResponse:
         return HealthResponse(
@@ -182,6 +227,185 @@ def create_app(
             service=resolved_settings.name,
             environment=resolved_settings.environment,
         )
+
+    @application.post(
+        "/erpnext/webhooks/material-request-reorder",
+        response_model=SourcingReviewSnapshot,
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["erpnext-events"],
+    )
+    async def receive_auto_reorder_webhook(
+        incoming_request: Request,
+        supplied_signature: Annotated[
+            str | None,
+            Depends(frappe_signature_header),
+        ],
+        active_sourcing_workflow: Annotated[
+            AutoReorderSourcingWorkflow,
+            Depends(provide_sourcing_workflow),
+        ],
+    ) -> SourcingReviewSnapshot:
+        body = await incoming_request.body()
+        if len(body) > MAX_WEBHOOK_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="ERPNext webhook body is too large",
+            )
+        try:
+            signature_is_valid = verify_frappe_webhook_signature(
+                body,
+                supplied_signature,
+                resolved_settings.erpnext_webhook_secret,
+            )
+        except WebhookSecurityConfigurationError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ERPNext webhook verification is not configured",
+            ) from None
+        if not signature_is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid ERPNext webhook signature",
+            )
+
+        try:
+            event = AutoReorderWebhookEvent.model_validate_json(body)
+        except ValidationError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid ERPNext auto-reorder event",
+            ) from None
+        if not event.auto_created_via_reorder:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Material Request event is not from automatic reorder",
+            )
+
+        review_request = AutoReorderReviewRequest(
+            review_id=review_id_for_material_request(event.name),
+            material_request_name=event.name,
+        )
+        try:
+            return await active_sourcing_workflow.start(
+                review_request,
+                source_id="erpnext-auto-reorder-webhook",
+            )
+        except SourcingReviewConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from None
+        except SourcingReviewScopeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from None
+        except ERPNextConfigurationError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ERPNext integration is not configured",
+            ) from None
+        except (ERPNextDataError, ValidationError, httpx.HTTPError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="ERPNext event verification or sourcing read failed safely",
+            ) from None
+
+    @application.get(
+        "/sourcing-reviews/by-material-request/{material_request_name}",
+        response_model=SourcingReviewSnapshot,
+        tags=["sourcing-review"],
+    )
+    async def get_sourcing_review_by_material_request(
+        material_request_name: str,
+        _actor: Annotated[PlatformActor, Depends(require_workflow_actor)],
+        active_sourcing_workflow: Annotated[
+            AutoReorderSourcingWorkflow,
+            Depends(provide_sourcing_workflow),
+        ],
+    ) -> SourcingReviewSnapshot:
+        review_id = review_id_for_material_request(material_request_name)
+        try:
+            return await active_sourcing_workflow.get(review_id)
+        except SourcingReviewNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from None
+
+    @application.get(
+        "/sourcing-reviews/{review_id}",
+        response_model=SourcingReviewSnapshot,
+        tags=["sourcing-review"],
+    )
+    async def get_sourcing_review(
+        review_id: UUID,
+        _actor: Annotated[PlatformActor, Depends(require_workflow_actor)],
+        active_sourcing_workflow: Annotated[
+            AutoReorderSourcingWorkflow,
+            Depends(provide_sourcing_workflow),
+        ],
+    ) -> SourcingReviewSnapshot:
+        try:
+            return await active_sourcing_workflow.get(review_id)
+        except SourcingReviewNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from None
+
+    @application.post(
+        "/sourcing-reviews/{review_id}/decision",
+        response_model=SourcingReviewSnapshot,
+        tags=["sourcing-review"],
+    )
+    async def decide_sourcing_review(
+        review_id: UUID,
+        request: SourcingReviewDecisionRequest,
+        approver_id: Annotated[str, Depends(require_approver)],
+        active_sourcing_workflow: Annotated[
+            AutoReorderSourcingWorkflow,
+            Depends(provide_sourcing_workflow),
+        ],
+    ) -> SourcingReviewSnapshot:
+        try:
+            return await active_sourcing_workflow.decide(
+                review_id,
+                assessment_hash=request.assessment_hash,
+                approver_id=approver_id,
+                decision=request.decision,
+                reason=request.reason,
+            )
+        except SourcingReviewNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from None
+        except SourcingReviewApprovalMismatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from None
+        except SourcingReviewSelfApprovalError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from None
+        except SourcingReviewStateError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from None
+        except ERPNextConfigurationError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ERPNext integration is not configured",
+            ) from None
+        except (ERPNextDataError, ValidationError, httpx.HTTPError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="ERPNext sourcing revalidation failed safely; retry decision",
+            ) from None
 
     @application.post(
         "/replenishment/proposals",

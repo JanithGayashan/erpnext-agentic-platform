@@ -23,11 +23,15 @@ def test_erpnext_credentials_are_secret_typed() -> None:
         environment="test",
         erpnext_api_key="test-key",
         erpnext_api_secret="test-secret",
+        erpnext_webhook_secret="test-webhook-secret",
     )
 
     assert settings.erpnext_api_key is not None
     assert settings.erpnext_api_secret is not None
+    assert settings.erpnext_webhook_secret is not None
     assert str(settings.erpnext_api_key) == "**********"
     assert str(settings.erpnext_api_secret) == "**********"
+    assert str(settings.erpnext_webhook_secret) == "**********"
     assert settings.erpnext_api_key.get_secret_value() == "test-key"
     assert settings.erpnext_api_secret.get_secret_value() == "test-secret"
+    assert settings.erpnext_webhook_secret.get_secret_value() == "test-webhook-secret"

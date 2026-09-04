@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     erpnext_item: str = "AGENTIC-TEST-ITEM"
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
+    erpnext_webhook_secret: SecretStr | None = None
 
     @model_validator(mode="after")
     def require_distinct_platform_credentials(self) -> Self:
