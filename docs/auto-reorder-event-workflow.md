@@ -1,8 +1,8 @@
 # Auto-Reorder Event Sourcing Workflow
 
-**Status:** Implemented and automated-test verified; live ERPNext Webhook activation
-still requires a shared secret and one controlled non-production reorder event.
-**Last reviewed:** 2026-09-04
+**Status:** Implemented and automated-test verified; a controlled local ERPNext
+Webhook activation was proved on 2026-09-06 (see activation evidence below).
+**Last reviewed:** 2026-10-16
 
 ## Objective
 
@@ -133,7 +133,7 @@ Create a Webhook through ERPNext Desk as a System Manager:
 | Condition | `doc.auto_created_via_reorder == 1 and doc.material_request_type == "Purchase"` |
 | Request URL | `http://host.docker.internal:8001/erpnext/webhooks/material-request-reorder` |
 | Request Method | `POST` |
-| Request Structure | leave empty and use Webhook Data rows |
+| Request Structure | `JSON` |
 | Enable Security | Yes |
 | Webhook Secret | same private value as `.env` |
 | Timeout | `10` seconds for the local experiment |
@@ -142,18 +142,23 @@ Add the header:
 
 | Key | Value |
 |---|---|
-| `Content-Type` | `application/json` |
+| `Content-Type` | `application/json` (Frappe normally adds this when JSON is selected) |
 
-Add these Webhook Data rows:
+Set **JSON Request Body** to:
 
-| Key | Fieldname |
-|---|---|
-| `doctype` | `doctype` |
-| `name` | `name` |
-| `auto_created_via_reorder` | `auto_created_via_reorder` |
+```json
+{
+  "doctype": "Material Request",
+  "name": "{{ doc.name }}",
+  "auto_created_via_reorder": {{ doc.auto_created_via_reorder }}
+}
+```
 
-Using Webhook Data rows avoids hand-built JSON escaping. Frappe signs the same
-serialized body that it transmits.
+The installed Frappe Webhook Data selector exposes document and standard meta
+fields, but not the runtime `doctype` property. A JSON request body therefore
+provides the required fixed `doctype` value explicitly. Frappe renders this
+template, parses it as JSON, and signs the same serialized body that it
+transmits.
 
 ### 4. Controlled non-production proof
 
@@ -171,9 +176,21 @@ Only after FastAPI and the Webhook are ready:
 Invoking the reorder job is a mutating test: it can create and submit a Material
 Request. Never run it casually against production.
 
-## Current activation blocker
+## Local development activation status
 
-The local `.env` does not yet contain `APP_ERPNEXT_WEBHOOK_SECRET`, and no live
-ERPNext Webhook has been configured by this repository. The code path is complete
-and tested, but ERPNext cannot deliver a signed event until those two matching
-secret settings exist and FastAPI is reachable from its container.
+The local development integration was activated and proved end to end on
+2026-09-06. The private webhook secret is configured in `.env` and in ERPNext,
+without being copied into this document. ERPNext can reach FastAPI through
+`host.docker.internal:8001`.
+
+The controlled proof produced submitted auto-reorder Material Request
+`MAT-MR-2026-00003` for 20 units of `AGENTIC-TEST-ITEM`. ERPNext delivered the
+signed webhook, FastAPI re-read the Material Request through the authenticated
+API, and LangGraph created review `7de64c99-0da6-5535-8c6d-f286607215d5` with
+status `AWAITING_REVIEW`. The deterministic assessment was
+`SUPPLIER_LINK_REVIEW_REQUIRED` because the Item has no linked Supplier.
+
+This is local test evidence, not a production-readiness claim. Production still
+needs managed secrets, HTTPS, durable deployment and queue monitoring, retry and
+alerting policy, and an explicit decision about what an approved review may
+create through the ERPNext API.
